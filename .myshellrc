@@ -1,0 +1,22 @@
+# === ALIASES ===
+alias ll="ls -alF --color=auto"
+alias ls="ls --color=auto"
+alias grep="grep --color=auto"
+alias c="clear"
+alias x="exit"
+alias em="emacs -nw"
+
+# Git Shortcuts Example
+alias ga="git add ."
+alias gc="git commit -m"
+alias gp="git push -u origin main"
+
+# === ENVIRONMENT VARIABLES Example ===
+# Setup your default tools and binary paths
+# export EDITOR=nano
+# export PATH=$PATH:/usr/local/go/bin
+
+# === STARTUP COMMANDS ===
+# These run automatically every time you open your terminal
+clear
+echo "here you go a clean myshell! "
