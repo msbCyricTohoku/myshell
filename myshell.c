@@ -1,12 +1,13 @@
 /*======================================================
   myshell.c - Minimal C Shell
   Features:
+   - True Multi-Line Rendering Engine (No screen tearing)
    - Dynamic Alias Engine (alias ll="ls -la")
    - Persistent History (~/.myshell_history)
    - Zsh-Style Prefix History Search (Up/Down Arrows)
-   - Live Git Branch Prompt Indicator
+   - Live Git Branch Prompt Indicator (Zero Latency)
    - Command Execution Time Tracking ([Xs])
-   - Ctrl+Left/Right Word Jumping
+   - Word Jumping (Ctrl+Left/Right, Alt+B/F) & Alt+Backspace
    - Startup Script Auto-Loader (~/.myshellrc)
    - Built-ins: alias, unalias, export, source, cd, exit
    - Infinite Pipeline Chaining (ls | grep | wc)
@@ -57,7 +58,6 @@ typedef struct {
   int is_dir;
   int is_exec;
 } Completion;
-
 typedef struct {
   char name[64];
   char val[MAX_LINE];
@@ -101,7 +101,7 @@ void init_history() {
       memmove(history[0], history[1], (MAX_HISTORY - 1) * MAX_LINE);
       history_count = MAX_HISTORY - 1;
     }
-    strcpy(history[history_count++], line);
+    snprintf(history[history_count++], MAX_LINE, "%s", line);
   }
   fclose(f);
 }
@@ -121,10 +121,10 @@ void add_history(const char *line) {
   if (!*line || (history_count && !strcmp(history[history_count - 1], line)))
     return;
   if (history_count < MAX_HISTORY)
-    strcpy(history[history_count++], line);
+    snprintf(history[history_count++], MAX_LINE, "%s", line);
   else {
     memmove(history[0], history[1], (MAX_HISTORY - 1) * MAX_LINE);
-    strcpy(history[MAX_HISTORY - 1], line);
+    snprintf(history[MAX_HISTORY - 1], MAX_LINE, "%s", line);
   }
   if (history_file[0]) {
     FILE *f = fopen(history_file, "a");
@@ -140,10 +140,9 @@ void get_suggestion(const char *in, char *out) {
   size_t len = strlen(in);
   if (!len)
     return;
-
   for (int i = history_count - 1; i >= 0; i--) {
     if (!strncmp(history[i], in, len) && strlen(history[i]) > len) {
-      strcpy(out, history[i] + len);
+      snprintf(out, MAX_LINE, "%s", history[i] + len);
       return;
     }
   }
@@ -165,9 +164,8 @@ void get_git_branch(char *buf, size_t max_size) {
         if (ref) {
           snprintf(buf, max_size, "%s", ref + 16);
           buf[strcspn(buf, "\r\n")] = '\0';
-        } else {
+        } else
           snprintf(buf, max_size, "%.7s", line); /* Detached HEAD */
-        }
       }
       fclose(f);
       return;
@@ -220,10 +218,8 @@ void expand_aliases(char **args) {
     if (!strcmp(args[0], aliases[i].name)) {
       static char a_buf[MAX_LINE];
       snprintf(a_buf, sizeof(a_buf), "%s", aliases[i].val);
-
       char *a_toks[MAX_ARGS];
       tokenize(a_buf, a_toks);
-
       int a_cnt = 0;
       while (a_toks[a_cnt])
         a_cnt++;
@@ -232,18 +228,17 @@ void expand_aliases(char **args) {
         p_cnt++;
       if (p_cnt + a_cnt >= MAX_ARGS)
         break;
-
       for (int x = p_cnt; x >= 1; x--)
         args[x + a_cnt - 1] = args[x];
       for (int x = 0; x < a_cnt; x++)
         args[x] = a_toks[x];
-      break;
+      break; /* Prevent infinite recursion */
     }
   }
 }
 
 /*======================================================
-  TERMINAL & UI ENGINE
+  TERMINAL RENDERING & UI ENGINE (Multi-Line Safe)
 ======================================================*/
 
 void disable_raw_mode() { tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios); }
@@ -259,50 +254,94 @@ int cmp_comp(const void *a, const void *b) {
   return strcmp(((Completion *)a)->display, ((Completion *)b)->display);
 }
 
+/* Accurately calculates real length of string by completely ignoring ANSI color
+ * codes */
+int get_visible_len(const char *str) {
+  int len = 0, in_esc = 0;
+  for (int i = 0; str[i]; i++) {
+    if (str[i] == '\033') {
+      in_esc = 1;
+      continue;
+    }
+    if (in_esc) {
+      if (isalpha((unsigned char)str[i]))
+        in_esc = 0;
+      continue;
+    }
+    if ((unsigned char)str[i] >= 32) {
+      if (((unsigned char)str[i] & 0xC0) != 0x80)
+        len++; /* Skip UTF-8 continuation bits */
+    }
+  }
+  return len;
+}
+
 int read_input(char *line) {
   int len = 0, pos = 0, tab_mode = 0, match_count = 0, match_idx = 0;
-  int menu_lines = 0, last_menu_lines = 0, history_pos = history_count,
-      word_pos = 0;
-  char suggestion[MAX_LINE] = "", cwd[1024], prompt[2048],
-       cur_in[MAX_LINE] = "", saved_tail[MAX_LINE] = "";
+  int last_cursor_row = 0, history_pos = history_count, word_pos = 0;
+  char suggestion[MAX_LINE] = "", cwd[1024], cur_in[MAX_LINE] = "",
+       saved_tail[MAX_LINE] = "";
   static Completion matches[MAX_MATCHES];
 
+  /* 1. Build Prompt Once for Zero-Latency Loop Editing */
   char host[256] = "local";
   gethostname(host, sizeof(host));
   char *user = getenv("USER");
   if (!user)
     user = "anon";
 
+  if (getcwd(cwd, sizeof(cwd)) == NULL)
+    strcpy(cwd, "?");
+  char *home = getenv("HOME"), d_cwd[1024];
+  if (home && !strncmp(cwd, home, strlen(home)))
+    snprintf(d_cwd, sizeof(d_cwd), "~%s", cwd + strlen(home));
+  else
+    strcpy(d_cwd, cwd);
+
+  char git_branch[64] = "";
+  get_git_branch(git_branch, sizeof(git_branch));
+  char git_prompt[128] = "";
+  if (git_branch[0])
+    snprintf(git_prompt, sizeof(git_prompt), " %sgit:(%s%s%s)", COLOR_GRAY,
+             COLOR_RED, git_branch, COLOR_GRAY);
+
+  char time_str[32] = "";
+  if (last_duration > 0)
+    snprintf(time_str, sizeof(time_str), "%s[%ds] ", COLOR_YELLOW,
+             last_duration);
+  const char *status_color = (last_status == 0) ? PROMPT_COLOR : ERR_COLOR;
+
+  char prompt[2048];
+  snprintf(prompt, sizeof(prompt), "%s%s%s@%s%s:%s%s%s %s❯%s ", time_str,
+           COLOR_CYAN, user, host, COLOR_RESET, DIR_COLOR, d_cwd, git_prompt,
+           status_color, COLOR_RESET);
+  int prompt_len = get_visible_len(prompt);
+
   line[0] = '\0';
   enable_raw_mode();
   int reading = 1;
+  int first_draw = 1;
 
   while (reading) {
-    if (getcwd(cwd, sizeof(cwd)) == NULL)
-      strcpy(cwd, "?");
-    char *home = getenv("HOME"), d_cwd[1024];
-    if (home && !strncmp(cwd, home, strlen(home)))
-      snprintf(d_cwd, sizeof(d_cwd), "~%s", cwd + strlen(home));
-    else
-      strcpy(d_cwd, cwd);
+    struct winsize w;
+    int t_cols = 80;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) != -1 && w.ws_col > 0)
+      t_cols = w.ws_col;
 
-    char git_branch[64] = "";
-    get_git_branch(git_branch, sizeof(git_branch));
-    char git_prompt[128] = "";
-    if (git_branch[0])
-      snprintf(git_prompt, sizeof(git_prompt), " %sgit:(%s%s%s)", COLOR_GRAY,
-               COLOR_RED, git_branch, COLOR_GRAY);
+    printf("\033[?25l"); /* Hide Cursor during redraw to stop flickering */
 
-    char time_str[32] = "";
-    if (last_duration > 0)
-      snprintf(time_str, sizeof(time_str), "%s[%ds] ", COLOR_YELLOW,
-               last_duration);
+    /* 2. Jump back to absolute start of prompt and completely wipe screen
+     * downward */
+    if (!first_draw) {
+      if (last_cursor_row > 0)
+        printf("\033[%dA", last_cursor_row);
+      printf("\r\033[J");
+    } else {
+      printf("\r\033[2K");
+      first_draw = 0;
+    }
 
-    const char *status_color = (last_status == 0) ? PROMPT_COLOR : ERR_COLOR;
-    snprintf(prompt, sizeof(prompt), "\r\033[2K%s%s%s@%s%s:%s%s%s %s❯%s ",
-             time_str, COLOR_CYAN, user, host, COLOR_RESET, DIR_COLOR, d_cwd,
-             git_prompt, status_color, COLOR_RESET);
-
+    /* 3. Draw Prompt & Text */
     printf("%s", prompt);
     for (int i = 0; i < len; i++)
       putchar(line[i]);
@@ -317,26 +356,31 @@ int read_input(char *line) {
     } else
       suggestion[0] = '\0';
 
-    menu_lines = 0;
+    /* Physical Line Wrap Edge Case */
+    int total_text_len = prompt_len + len + g_len;
+    if (total_text_len > 0 && total_text_len % t_cols == 0)
+      printf(" \b");
+    int text_rows = total_text_len / t_cols;
+
+    /* 4. Draw Dropdown Menu */
+    int menu_lines = 0;
     if (tab_mode && match_count > 0) {
-      struct winsize w;
-      int t_cols = (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) != -1 && w.ws_col > 0)
-                       ? w.ws_col
-                       : 80;
+      printf("\r\n\033[K");
+      menu_lines++;
       int max_len = 0;
       for (int i = 0; i < match_count; i++) {
         int l = strlen(matches[i].display) + matches[i].is_dir;
         if (l > max_len)
           max_len = l;
       }
-      int col_w = max_len + 2, cols = t_cols / col_w;
-      if (!cols)
-        cols = 1;
-      int m_show = cols * 5, s_idx = (match_idx / m_show) * m_show,
+      int col_w = max_len + 2, num_cols = t_cols / col_w;
+      if (!num_cols)
+        num_cols = 1;
+      int m_show = num_cols * 5, s_idx = (match_idx / m_show) * m_show,
           e_idx = (s_idx + m_show > match_count) ? match_count : s_idx + m_show;
 
       for (int i = s_idx; i < e_idx; i++) {
-        if ((i - s_idx) % cols == 0) {
+        if ((i - s_idx) % num_cols == 0 && i != s_idx) {
           printf("\r\n\033[K");
           menu_lines++;
         }
@@ -349,7 +393,7 @@ int read_input(char *line) {
                matches[i].display, matches[i].is_dir ? "/" : "");
         for (int p = 0;
              p < col_w - (int)strlen(matches[i].display) - matches[i].is_dir &&
-             (i + 1 - s_idx) % cols != 0;
+             (i + 1 - s_idx) % num_cols != 0;
              p++)
           printf(" ");
         printf("\033[0m");
@@ -360,22 +404,24 @@ int read_input(char *line) {
         menu_lines++;
       }
     }
-    for (int i = menu_lines; i < last_menu_lines; i++)
-      printf("\r\n\033[K");
 
-    int down = menu_lines > last_menu_lines ? menu_lines : last_menu_lines;
-    if (down > 0) {
-      printf("\033[%dA\r\033[2K%s", down, prompt);
-      for (int i = 0; i < len; i++)
-        putchar(line[i]);
-      if (g_len)
-        printf("%s%s%s", SUGG_COLOR, suggestion, COLOR_RESET);
-    }
-    last_menu_lines = menu_lines;
-    int left = (len - pos) + g_len;
-    if (left > 0)
-      printf("\033[%dD", left);
+    /* 5. Snap cursor exactly back into the multi-line block via math */
+    int target_row = (prompt_len + pos) / t_cols;
+    int target_col = (prompt_len + pos) % t_cols;
+
+    int current_row = text_rows + menu_lines;
+    int go_up = current_row - target_row;
+
+    if (go_up > 0)
+      printf("\033[%dA", go_up);
+    printf("\r");
+    if (target_col > 0)
+      printf("\033[%dC", target_col);
+
+    printf("\033[?25h"); /* Restore Cursor */
     fflush(stdout);
+    last_cursor_row =
+        target_row; /* Tracks Y offset state for next cycle redraw wipe */
 
     char c;
     if (read(STDIN_FILENO, &c, 1) != 1) {
@@ -385,27 +431,25 @@ int read_input(char *line) {
 
     switch (c) {
     case 10:
-    case 13:
-      if (last_menu_lines > 0) {
-        for (int i = 0; i < last_menu_lines; i++)
-          printf("\r\n\033[K");
-        printf("\033[%dA\r\033[2K%s", last_menu_lines, prompt);
-        for (int i = 0; i < len; i++)
-          putchar(line[i]);
-      } else if (len > pos) {
-        printf("\r\033[2K%s", prompt);
-        for (int i = 0; i < len; i++)
-          putchar(line[i]);
-      }
-      printf("\n");
+    case 13: {
+      int down = text_rows - target_row;
+      if (down > 0)
+        printf("\033[%dB", down);
+      printf("\r\n\033[J"); /* Cleanly drops beneath command and permanently
+                               erases ghosts/menus */
       reading = 0;
       break;
-    case 3:
+    }
+    case 3: {
+      int down = text_rows - target_row;
+      if (down > 0)
+        printf("\033[%dB", down);
+      printf("\r\n\033[J^C\n");
       pos = len = 0;
       line[0] = '\0';
       reading = 0;
-      printf("^C\n");
       break;
+    }
     case 4:
       if (!len) {
         disable_raw_mode();
@@ -419,6 +463,8 @@ int read_input(char *line) {
       break;
     case 12:
       printf("\033[H\033[2J");
+      last_cursor_row = 0;
+      first_draw = 1;
       break;
     case 21:
       memmove(&line[0], &line[pos], len - pos + 1);
@@ -453,74 +499,104 @@ int read_input(char *line) {
       break;
 
     case 27: {
-      char seq[8]; /* Safely sized to handle any multi-key sequence without
-                      overflows */
+      char seq[8];
       struct termios t_raw = orig_termios;
       t_raw.c_lflag &= ~(ECHO | ICANON | ISIG);
       t_raw.c_cc[VMIN] = 0;
       t_raw.c_cc[VTIME] = 1;
       tcsetattr(STDIN_FILENO, TCSANOW, &t_raw);
-      if (read(STDIN_FILENO, &seq[0], 1) == 1 && seq[0] == '[' &&
-          read(STDIN_FILENO, &seq[1], 1) == 1) {
-        if (seq[1] == 'A') {
-          if (history_pos == history_count)
-            strcpy(cur_in, line);
-          while (history_pos > 0) {
-            history_pos--;
-            if (!strncmp(history[history_pos], cur_in, strlen(cur_in))) {
-              strcpy(line, history[history_pos]);
-              pos = len = strlen(line);
-              break;
+      if (read(STDIN_FILENO, &seq[0], 1) == 1) {
+        if (seq[0] == '[') {
+          if (read(STDIN_FILENO, &seq[1], 1) == 1) {
+            if (seq[1] == 'A') { /* Zsh Up */
+              if (history_pos == history_count)
+                snprintf(cur_in, MAX_LINE, "%s", line);
+              while (history_pos > 0) {
+                history_pos--;
+                if (!strncmp(history[history_pos], cur_in, strlen(cur_in))) {
+                  snprintf(line, MAX_LINE, "%s", history[history_pos]);
+                  pos = len = strlen(line);
+                  break;
+                }
+              }
+            } else if (seq[1] == 'B') { /* Zsh Down */
+              while (history_pos < history_count) {
+                history_pos++;
+                if (history_pos == history_count) {
+                  snprintf(line, MAX_LINE, "%s", cur_in);
+                  pos = len = strlen(line);
+                  break;
+                }
+                if (!strncmp(history[history_pos], cur_in, strlen(cur_in))) {
+                  snprintf(line, MAX_LINE, "%s", history[history_pos]);
+                  pos = len = strlen(line);
+                  break;
+                }
+              }
+            } else if (seq[1] == 'C') {
+              if (pos < len)
+                pos++;
+              else if (suggestion[0]) {
+                snprintf(line + len, MAX_LINE - len, "%s", suggestion);
+                pos = len = strlen(line);
+                suggestion[0] = '\0';
+              }
+            } else if (seq[1] == 'D') {
+              if (pos > 0)
+                pos--;
+            } else if (seq[1] == 'H')
+              pos = 0;
+            else if (seq[1] == 'F')
+              pos = len;
+            else if (seq[1] == '3' && read(STDIN_FILENO, &seq[2], 1) == 1 &&
+                     seq[2] == '~' && pos < len) {
+              memmove(&line[pos], &line[pos + 1], len - pos);
+              len--;
+            } else if (seq[1] == '1' && read(STDIN_FILENO, &seq[2], 1) == 1 &&
+                       seq[2] == ';') {
+              if (read(STDIN_FILENO, &seq[3], 1) == 1 &&
+                  read(STDIN_FILENO, &seq[4], 1) == 1) {
+                if (seq[3] == '5' && seq[4] == 'C') {
+                  while (pos < len && line[pos] != ' ')
+                    pos++;
+                  while (pos < len && line[pos] == ' ')
+                    pos++;
+                } else if (seq[3] == '5' && seq[4] == 'D') {
+                  while (pos > 0 && line[pos - 1] == ' ')
+                    pos--;
+                  while (pos > 0 && line[pos - 1] != ' ')
+                    pos--;
+                }
+              }
             }
           }
-        } else if (seq[1] == 'B') {
-          while (history_pos < history_count) {
-            history_pos++;
-            if (history_pos == history_count) {
-              strcpy(line, cur_in);
-              pos = len = strlen(line);
-              break;
-            }
-            if (!strncmp(history[history_pos], cur_in, strlen(cur_in))) {
-              strcpy(line, history[history_pos]);
-              pos = len = strlen(line);
-              break;
-            }
+        } else if (seq[0] == 'O') {
+          if (read(STDIN_FILENO, &seq[1], 1) == 1) {
+            if (seq[1] == 'H')
+              pos = 0;
+            else if (seq[1] == 'F')
+              pos = len;
           }
-        } else if (seq[1] == 'C') {
-          if (pos < len)
-            pos++;
-          else if (suggestion[0]) {
-            strcat(line, suggestion);
-            pos = len = strlen(line);
-            suggestion[0] = '\0';
-          }
-        } else if (seq[1] == 'D') {
-          if (pos > 0)
+        } else if (seq[0] == 'b') { /* Alt+B */
+          while (pos > 0 && line[pos - 1] == ' ')
             pos--;
-        } else if (seq[1] == 'H')
-          pos = 0;
-        else if (seq[1] == 'F')
-          pos = len;
-        else if (seq[1] == '3' && read(STDIN_FILENO, &seq[2], 1) == 1 &&
-                 seq[2] == '~' && pos < len) {
-          memmove(&line[pos], &line[pos + 1], len - pos);
-          len--;
-        } else if (seq[1] == '1' && read(STDIN_FILENO, &seq[2], 1) == 1 &&
-                   seq[2] == ';') {
-          if (read(STDIN_FILENO, &seq[3], 1) == 1 &&
-              read(STDIN_FILENO, &seq[4], 1) == 1) {
-            if (seq[3] == '5' && seq[4] == 'C') {
-              while (pos < len && line[pos] != ' ')
-                pos++;
-              while (pos < len && line[pos] == ' ')
-                pos++;
-            } else if (seq[3] == '5' && seq[4] == 'D') {
-              while (pos > 0 && line[pos - 1] == ' ')
-                pos--;
-              while (pos > 0 && line[pos - 1] != ' ')
-                pos--;
-            }
+          while (pos > 0 && line[pos - 1] != ' ')
+            pos--;
+        } else if (seq[0] == 'f') { /* Alt+F */
+          while (pos < len && line[pos] != ' ')
+            pos++;
+          while (pos < len && line[pos] == ' ')
+            pos++;
+        } else if (seq[0] == 127 || seq[0] == 8) { /* Alt+Backspace */
+          if (pos > 0) {
+            int s = pos - 1;
+            while (s > 0 && line[s] == ' ')
+              s--;
+            while (s > 0 && line[s - 1] != ' ')
+              s--;
+            memmove(&line[s], &line[pos], len - pos + 1);
+            len -= (pos - s);
+            pos = s;
           }
         }
       }
@@ -530,7 +606,7 @@ int read_input(char *line) {
       break;
     }
 
-    case 9: {
+    case 9: { /* Autocompletion Engine */
       if (!tab_mode) {
         match_count = match_idx = 0;
         word_pos = pos;
@@ -1097,7 +1173,6 @@ void load_rc(const char *filepath) {
   last_duration = 0;
 }
 
-/*========= Main ==========*/
 int main() {
   tcgetattr(STDIN_FILENO, &orig_termios);
   atexit(disable_raw_mode);
