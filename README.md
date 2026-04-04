@@ -2,21 +2,6 @@
 
 A minimal C shell.
 
-## Features
-- Dynamic Alias Engine (alias ll="ls -la")
-- Persistent History (~/.myshell_history)
-- Zsh-Style Prefix History Search (Up/Down Arrows)
-- Live Git Branch Prompt Indicator
-- Command Execution Time Tracking ([Xs])
-- Ctrl+Left/Right Word Jumping
-- Startup Script Auto-Loader (~/.myshellrc)
-- Built-ins: alias, unalias, export, source, cd, exit
-- Infinite Pipeline Chaining (ls | grep | wc)
-- Logical Operators (&&, ||, ;) & Backgrounds (&)
-- Wildcard Globbing Expansion (*.c, ?)
-- Grid-Style Tab Autocompletion Menu
-
-
 ## Installation
 
 Compile with standard C compiler (`gcc`) and `make`.

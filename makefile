@@ -1,5 +1,5 @@
 CC ?= gcc
-CFLAGS ?= -Wall -Wextra -O3
+CFLAGS ?= -g -Wall -Wextra -O3
 TARGET = myshell
 PREFIX ?= /usr/local
 
